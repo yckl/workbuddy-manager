@@ -1,6 +1,9 @@
-# WorkBuddy Manager —— 本机启动脚本（Windows / PowerShell）
+﻿# WorkBuddy Manager —— 本机启动脚本（Windows / PowerShell）
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = $PSScriptRoot
+if (-not $root -and $MyInvocation.MyCommand.Path) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $root -and $MyInvocation.MyCommand.Definition) { $root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $root) { $root = (Get-Location).Path }
 Set-Location $root
 
 # 启用现代 TLS 协议支持

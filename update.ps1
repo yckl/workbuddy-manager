@@ -1,6 +1,9 @@
 ﻿# WorkBuddy Manager —— 跨机器通用自动化更新程序（Windows）
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = $PSScriptRoot
+if (-not $root -and $MyInvocation.MyCommand.Path) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $root -and $MyInvocation.MyCommand.Definition) { $root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $root) { $root = (Get-Location).Path }
 Set-Location $root
 
 # 启用现代 TLS 协议支持
@@ -70,7 +73,8 @@ function Get-SmartDownloadDirectories {
 function Find-LocalPackage {
     param(
         [string[]]$searchDirectories,
-        [string]$targetVersion
+        [string]$targetVersion = $null,
+        [string]$proxy = $null
     )
     foreach ($d in $searchDirectories) {
         if (-not (Test-Path $d)) { continue }
@@ -83,9 +87,45 @@ function Find-LocalPackage {
             } | Sort-Object LastWriteTime -Descending
         
         foreach ($c in $candidates) {
-            # 必须严格存在同名 .sig 签名文件，杜绝未签名包绕过校验
             $sigPath = "$($c.FullName).sig"
-            if (-not (Test-Path $sigPath)) { continue }
+            # 若本地缺少 .sig 或小于 100 字节，尝试自动拉取配套官方签名
+            if (-not (Test-Path $sigPath) -or ((Get-Item $sigPath).Length -lt 100)) {
+                if ($c.Name -match 'workbuddy-manager-(v?\d+\.\d+\.\d+[\w\.\-]*)\.tar\.gz') {
+                    $pkgVer = $Matches[1]
+                    $sigUrl = "https://github.com/ithtelab/workbuddy-manager/releases/download/$pkgVer/workbuddy-manager-$pkgVer.tar.gz.sig"
+                    Write-Host "[INFO] 发现安装包 $($c.Name)，正在自动获取官方签名 (.sig)..." -ForegroundColor Cyan
+                    
+                    $curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+                    $sigDone = $false
+                    if ($curlExe) {
+                        $pList = @()
+                        if ($proxy) { $pList += $proxy }
+                        $pList += @('http://127.0.0.1:7897', 'http://127.0.0.1:7890', '')
+                        foreach ($p in $pList) {
+                            $cArgs = @('-s', '-L', '--fail', '--connect-timeout', '4')
+                            if ($p) { $cArgs += @('-x', $p) }
+                            $cArgs += @('-o', $sigPath, $sigUrl)
+                            & $curlExe $cArgs
+                            if ($LASTEXITCODE -eq 0 -and (Test-Path $sigPath) -and ((Get-Item $sigPath).Length -gt 100)) {
+                                $sigDone = $true
+                                Write-Host "[SUCCESS] 官方签名获取成功: $sigPath" -ForegroundColor Green
+                                break
+                            }
+                        }
+                    }
+                    if (-not $sigDone) {
+                        try {
+                            Invoke-WebRequest -Uri $sigUrl -OutFile $sigPath -TimeoutSec 5 -UseBasicParsing -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                }
+            }
+
+            # 必须严格存在有效 .sig 签名文件，杜绝未签名包绕过校验
+            if (-not (Test-Path $sigPath) -or ((Get-Item $sigPath).Length -lt 100)) {
+                Write-Host "[WARN] 发现安装包 $($c.Name)，但缺少配套签名 ($($c.Name).sig)。根据官方安全策略，必须验签后方可安装。" -ForegroundColor Yellow
+                continue
+            }
 
             if ($targetVersion) {
                 if ($c.Name -match [regex]::Escape($targetVersion)) {
@@ -255,7 +295,7 @@ $latestVer = if ($tagInfo) { $tagInfo.Tag } else { $null }
 $detectedProxy = if ($tagInfo) { $tagInfo.Proxy } else { if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { 'http://127.0.0.1:7897' } }
 
 $searchDirs = Get-SmartDownloadDirectories
-$existingPkg = Find-LocalPackage -searchDirectories $searchDirs -targetVersion $null
+$existingPkg = Find-LocalPackage -searchDirectories $searchDirs -targetVersion $null -proxy $detectedProxy
 
 # 若网络未连通但找到了离线包，从离线包文件名直接推导版本号
 if (-not $latestVer -and $existingPkg) {
@@ -346,16 +386,19 @@ if ($targetPkg) {
 
     # 尝试方式 2: 调起浏览器下载并自动监听感应
     if (-not $downloadSuccess) {
-        Write-Host "[WARN] 命令行下载受阻，自动为您在浏览器中打开官方发布包与签名直链..." -ForegroundColor Yellow
-        Start-Process $tarUrl
+        $tarAlreadyOk = (Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000)
+        Write-Host "[WARN] 命令行下载受阻，自动为您在浏览器中打开官方发布包直链..." -ForegroundColor Yellow
+        if (-not $tarAlreadyOk) {
+            Start-Process $tarUrl
+        }
         Start-Process $sigUrl
 
-        Write-Host "[WAIT] 正在实时监听下载目录（下载完 tar.gz 与 .sig 后将自动识别并验签更新）..." -ForegroundColor Cyan
+        Write-Host "[WAIT] 正在实时监听下载目录（检测到官方签名包后将自动验签并更新）..." -ForegroundColor Cyan
 
         $watchTimeoutSeconds = 300
         $startTime = [DateTime]::Now
 
-        while (-not (Test-Path $tempTar) -or -not (Test-Path $tempSig)) {
+        while (-not (Test-Path $tempTar) -or -not (Test-Path $tempSig) -or ((Get-Item $tempTar).Length -le 5000000) -or ((Get-Item $tempSig).Length -lt 100)) {
             Start-Sleep -Seconds 2
             
             if (([DateTime]::Now - $startTime).TotalSeconds -gt $watchTimeoutSeconds) {
@@ -363,12 +406,26 @@ if ($targetPkg) {
                 exit 1
             }
 
-            $detected = Find-LocalPackage -searchDirectories $searchDirs -targetVersion $latestVer
+            # 若安装包已存在但缺少签名，后台主动轮询拉取官方 .sig (仅 294 字节)
+            if ((Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000) -and (-not (Test-Path $tempSig) -or ((Get-Item $tempSig).Length -lt 100))) {
+                if ($curlExe) {
+                    $cArgs = @('-s', '-L', '--fail', '--connect-timeout', '4')
+                    if ($detectedProxy) { $cArgs += @('-x', $detectedProxy) }
+                    $cArgs += @('-o', $tempSig, $sigUrl)
+                    & $curlExe $cArgs
+                    if ($LASTEXITCODE -eq 0 -and (Test-Path $tempSig) -and ((Get-Item $tempSig).Length -gt 100)) {
+                        Write-Host "[SUCCESS] 官方签名已自动拉取成功。" -ForegroundColor Green
+                        break
+                    }
+                }
+            }
+
+            $detected = Find-LocalPackage -searchDirectories $searchDirs -targetVersion $latestVer -proxy $detectedProxy
             if ($detected -and ($detected.Archive.LastWriteTime -gt $startTime.AddMinutes(-5))) {
                 try {
                     $stream = [System.IO.File]::Open($detected.Archive.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
                     $stream.Dispose()
-                    Write-Host "[SUCCESS] 检测到下载完成: $($detected.Archive.FullName)" -ForegroundColor Green
+                    Write-Host "[SUCCESS] 检测到签名安装包准备就绪: $($detected.Archive.FullName)" -ForegroundColor Green
                     Copy-Item -Path $detected.Archive.FullName -Destination $tempTar -Force
                     Copy-Item -Path $detected.Sig.FullName -Destination $tempSig -Force
                     break

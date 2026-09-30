@@ -1,5 +1,8 @@
 ﻿# WorkBuddy Manager —— 停止本机服务（Windows / PowerShell）
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = $PSScriptRoot
+if (-not $root -and $MyInvocation.MyCommand.Path) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $root -and $MyInvocation.MyCommand.Definition) { $root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $root) { $root = (Get-Location).Path }
 & (Join-Path $root 'service-tools.ps1') stop
 
 $upstreamStop = Join-Path $root 'upstream\stop-workbuddy2api.cmd'

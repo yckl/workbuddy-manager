@@ -13,7 +13,10 @@ param(
     [string]$Action = 'status'
 )
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = $PSScriptRoot
+if (-not $root -and $MyInvocation.MyCommand.Path) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $root -and $MyInvocation.MyCommand.Definition) { $root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $root) { $root = (Get-Location).Path }
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $outLog = Join-Path $root 'data\manager.out.log'
 $errLog = Join-Path $root 'data\manager.err.log'
